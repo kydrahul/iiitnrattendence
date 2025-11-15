@@ -17,7 +17,7 @@ const App = () => (
     <TooltipProvider>
       <Toaster />
       <Sonner />
-      <BrowserRouter>
+      <BrowserRouter basename="/iiitnrattendence">
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/qr-session/:classId" element={<QRSession />} />

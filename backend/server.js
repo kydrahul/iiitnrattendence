@@ -13,11 +13,8 @@ const admin = require('firebase-admin');
 
 // Load service account from environment variable or file
 let serviceAccount;
-if (process.env.FIREBASE_SERVICE_ACCOUNT_PATH) {
+if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
   // Production: Load from secret file path
-  serviceAccount = require(process.env.FIREBASE_SERVICE_ACCOUNT_PATH);
-} else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-  // Alternative: Google's standard env var
   serviceAccount = require(process.env.GOOGLE_APPLICATION_CREDENTIALS);
 } else {
   // Development: Load from local file
@@ -25,7 +22,7 @@ if (process.env.FIREBASE_SERVICE_ACCOUNT_PATH) {
     serviceAccount = require('./iiitnr-attendence-app-f604e-firebase-adminsdk-fbsvc-e79f0f1be5.json');
   } catch (err) {
     console.error('❌ Firebase service account not found!');
-    console.error('   Set FIREBASE_SERVICE_ACCOUNT_PATH environment variable in production');
+    console.error('   Set GOOGLE_APPLICATION_CREDENTIALS environment variable in production');
     process.exit(1);
   }
 }
