@@ -4,6 +4,13 @@ import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -91,6 +98,7 @@ const Dashboard = () => {
   const [classQuery, setClassQuery] = useState("");
   const [selectedClass, setSelectedClass] = useState<string | null>(null);
   const [showClassSuggestions, setShowClassSuggestions] = useState(false);
+  const [selectedQuickCourse, setSelectedQuickCourse] = useState<string>("");
   const [latitude, setLatitude] = useState<string>("");
   const [longitude, setLongitude] = useState<string>("");
   const [homeQRValue, setHomeQRValue] = useState<string>("");
@@ -303,13 +311,11 @@ const Dashboard = () => {
     }
   };
 
-  // Class autocomplete options (3 branches x 6 years)
-  const classOptions = [
-    'CSE2024','CSE2025','CSE2026','CSE2027','CSE2028','CSE2029',
-    'DSAI2024','DSAI2025','DSAI2026','DSAI2027','DSAI2028','DSAI2029',
-    'ECE2024','ECE2025','ECE2026','ECE2027','ECE2028','ECE2029'
-  ];
-  const filteredClassOptions = classOptions.filter(opt => opt.toLowerCase().includes(classQuery.toLowerCase()));
+  // Class autocomplete options - only show classes where faculty has created courses
+  const uniqueClasses = Array.from(
+    new Set(facultyData.courses.map(c => `${c.branch}${c.year}`))
+  ).sort();
+  const filteredClassOptions = uniqueClasses.filter(opt => opt.toLowerCase().includes(classQuery.toLowerCase()));
 
   const handleClassAdded = async (_classData: any) => {
     // Refresh from API to ensure consistent view
@@ -386,24 +392,58 @@ const Dashboard = () => {
   };
 
   const generateHomeQR = () => {
+    // Validate class selection
     const cls = selectedClass || classQuery;
     if (!cls) {
       toast.error('Please select a class');
       return;
     }
-    const payload = {
-      type: 'attendance',
-      class: cls,
-      location: latitude && longitude ? { latitude, longitude } : undefined,
-      expiresIn: qrDuration * 60,
-      geofenceRadius: locationRadius,
-      ts: Date.now()
-    };
-    setHomeQRValue(JSON.stringify(payload));
-    setQrActive(true);
-    setQrTimer(qrDuration * 60);
+    
+    // Validate course selection
+    if (!selectedQuickCourse) {
+      toast.error('Please select a course/subject');
+      return;
+    }
+
+    // Find the selected course
+    const course = courses.find(c => c.id === selectedQuickCourse);
+    if (!course) {
+      toast.error('Course not found');
+      return;
+    }
+
+    // Switch to the course view and start session
+    setSelectedCourse(course);
+    setActiveTab('classes');
+    
+    // Reset session state
+    setQrActive(false);
     setSessionEnded(false);
-    toast.success('QR generated');
+    setAttendanceList([]);
+    
+    // Use course-specific students if available
+    const courseStudents = course.students?.map(s => ({
+      id: s.id,
+      name: s.name,
+      roll: s.rollNumber,
+      status: null as 'present' | 'absent' | null
+    })) || students;
+    setStudentList(courseStudents);
+    
+    // Auto-generate QR for the course
+    setTimeout(() => {
+      setQrActive(true);
+      setQrTimer(qrDuration * 60);
+      const qrData = JSON.stringify({
+        type: 'course-attendance',
+        courseId: course.id,
+        timestamp: Date.now(),
+        expiresIn: qrDuration * 60,
+        location: latitude && longitude ? { latitude, longitude, radius: locationRadius } : undefined
+      });
+      setCourseQRValue(qrData);
+      toast.success(`Session started for ${course.courseName}`);
+    }, 100);
   };
 
   return (
@@ -494,7 +534,12 @@ const Dashboard = () => {
                   <Input
                     placeholder="e.g., CSE2024"
                     value={selectedClass ? selectedClass : classQuery}
-                    onChange={(e) => { setSelectedClass(null); setClassQuery((e.target as HTMLInputElement).value); setShowClassSuggestions(true); }}
+                    onChange={(e) => { 
+                      setSelectedClass(null); 
+                      setClassQuery((e.target as HTMLInputElement).value); 
+                      setShowClassSuggestions(true);
+                      setSelectedQuickCourse(""); // Reset course when class changes
+                    }}
                     onFocus={() => setShowClassSuggestions(true)}
                     onBlur={() => setTimeout(() => setShowClassSuggestions(false), 100)}
                     onKeyDown={(e) => { if (e.key === 'Escape') setShowClassSuggestions(false); }}
@@ -507,13 +552,52 @@ const Dashboard = () => {
                         <button
                           key={opt}
                           className="w-full text-left px-3 py-2 hover:bg-muted text-sm"
-                          onClick={() => { setSelectedClass(opt); setClassQuery(''); setShowClassSuggestions(false); }}
+                          onClick={() => { 
+                            setSelectedClass(opt); 
+                            setClassQuery(''); 
+                            setShowClassSuggestions(false);
+                            
+                            // Auto-select course if only one option
+                            const matchingCourses = courses.filter(c => c.className === opt);
+                            if (matchingCourses.length === 1) {
+                              setSelectedQuickCourse(matchingCourses[0].id);
+                            } else {
+                              setSelectedQuickCourse("");
+                            }
+                          }}
                         >
                           {opt}
                         </button>
                       ))}
                     </div>
                   )}
+                </div>
+
+                {/* Course/Subject selector */}
+                <div>
+                  <label className="block text-sm font-medium mb-2">Select Course/Subject</label>
+                  <Select 
+                    value={selectedQuickCourse} 
+                    onValueChange={setSelectedQuickCourse}
+                    disabled={!selectedClass && !classQuery}
+                  >
+                    <SelectTrigger>
+                      <SelectValue placeholder="Choose subject" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {courses
+                        .filter(c => {
+                          const cls = selectedClass || classQuery;
+                          return cls ? c.className === cls : true;
+                        })
+                        .map(course => (
+                          <SelectItem key={course.id} value={course.id}>
+                            {course.courseCode} - {course.courseName}
+                          </SelectItem>
+                        ))
+                      }
+                    </SelectContent>
+                  </Select>
                 </div>
 
                 {/* QR Duration */}
@@ -535,16 +619,8 @@ const Dashboard = () => {
 
               <div className="mt-4 flex items-center gap-3">
                 <Button onClick={generateHomeQR} className="gap-2">
-                  <QrCode className="w-4 h-4" /> Generate QR
+                  <QrCode className="w-4 h-4" /> Start Session
                 </Button>
-                {qrActive && homeQRValue && (
-                  <div className="flex items-center gap-4">
-                    <div className="bg-muted p-3 rounded-lg">
-                      <QRCodeSVG value={homeQRValue} size={96} level="H" />
-                    </div>
-                    <div className="text-sm text-muted-foreground">Expires in {formatTime(qrTimer)}</div>
-                  </div>
-                )}
               </div>
             </Card>
 
