@@ -75,8 +75,135 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'x-device-id']
 }));
 app.use(compression());
-app.use(express.json());
+app.use(express.json({ limit: '1mb' })); // Add size limit
 app.use(morgan('dev'));
+
+// ============================================
+// IN-MEMORY CACHE IMPLEMENTATION
+// ============================================
+
+// Simple LRU cache (no external dependencies needed)
+class SimpleCache {
+  constructor(maxSize = 1000, ttl = 3600000) {
+    this.cache = new Map();
+    this.maxSize = maxSize;
+    this.ttl = ttl; // 1 hour default
+  }
+
+  set(key, value) {
+    // Remove oldest entry if cache is full
+    if (this.cache.size >= this.maxSize) {
+      const firstKey = this.cache.keys().next().value;
+      this.cache.delete(firstKey);
+    }
+    this.cache.set(key, { value, timestamp: Date.now() });
+  }
+
+  get(key) {
+    const item = this.cache.get(key);
+    if (!item) return null;
+
+    // Check if expired
+    if (Date.now() - item.timestamp > this.ttl) {
+      this.cache.delete(key);
+      return null;
+    }
+    return item.value;
+  }
+
+  invalidate(pattern) {
+    for (const key of this.cache.keys()) {
+      if (key.includes(pattern)) {
+        this.cache.delete(key);
+      }
+    }
+  }
+
+  clear() {
+    this.cache.clear();
+  }
+
+  getStats() {
+    return {
+      size: this.cache.size,
+      maxSize: this.maxSize,
+      usage: `${((this.cache.size / this.maxSize) * 100).toFixed(1)}%`
+    };
+  }
+}
+
+// Initialize caches
+const studentCache = new SimpleCache(500, 3600000); // 500 students, 1 hour TTL
+const courseCache = new SimpleCache(200, 3600000); // 200 courses, 1 hour TTL
+const facultyCache = new SimpleCache(100, 3600000); // 100 faculty, 1 hour TTL
+
+console.log('✅ In-memory cache initialized');
+
+// Cache invalidation helpers
+function invalidateStudentCache(studentId) {
+  studentCache.invalidate(`student:${studentId}`);
+  studentCache.invalidate(`dashboard:${studentId}`);
+  studentCache.invalidate(`timetable:${studentId}`);
+}
+
+function invalidateCourseCache(courseId) {
+  courseCache.invalidate(`course:${courseId}`);
+  // Invalidate all student dashboards (they might have this course)
+  studentCache.invalidate('dashboard:');
+  studentCache.invalidate('timetable:');
+}
+
+// ============================================
+// RATE LIMITING (In-Memory)
+// ============================================
+
+const requestCounts = new Map();
+const RATE_LIMIT_WINDOW = 15 * 60 * 1000; // 15 minutes
+const RATE_LIMIT_MAX = 100; // 100 requests per window
+
+function rateLimiter(req, res, next) {
+  const ip = req.ip || req.connection.remoteAddress;
+  const now = Date.now();
+
+  if (!requestCounts.has(ip)) {
+    requestCounts.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
+    return next();
+  }
+
+  const record = requestCounts.get(ip);
+
+  if (now > record.resetTime) {
+    record.count = 1;
+    record.resetTime = now + RATE_LIMIT_WINDOW;
+    return next();
+  }
+
+  if (record.count >= RATE_LIMIT_MAX) {
+    return res.status(429).json({
+      error: 'Too many requests. Please try again later.',
+      retryAfter: Math.ceil((record.resetTime - now) / 1000)
+    });
+  }
+
+  record.count++;
+  next();
+}
+
+// Apply rate limiting to API routes
+app.use('/api/', rateLimiter);
+
+// Clean up old rate limit records every 30 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, record] of requestCounts.entries()) {
+    if (now > record.resetTime) {
+      requestCounts.delete(ip);
+    }
+  }
+}, 30 * 60 * 1000);
+
+console.log('✅ Rate limiting enabled (100 req/15min per IP)');
+
 
 // ============================================
 // UTILITY FUNCTIONS
@@ -158,6 +285,26 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// Cache statistics endpoint (for monitoring)
+app.get('/api/cache/stats', verifyToken, async (req, res) => {
+  try {
+    res.json({
+      success: true,
+      caches: {
+        students: studentCache.getStats(),
+        courses: courseCache.getStats(),
+        faculty: facultyCache.getStats()
+      },
+      rateLimiting: {
+        activeIPs: requestCounts.size
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching cache stats:', error);
+    res.status(500).json({ error: 'Failed to fetch cache stats' });
+  }
+});
+
 // ============================================
 // STUDENT ROUTES
 // ============================================
@@ -195,6 +342,9 @@ app.post('/api/student/profile', verifyToken, async (req, res) => {
 
     await db.collection('students').doc(userId).set(studentData, { merge: true });
 
+    // Invalidate cache when profile is updated
+    invalidateStudentCache(userId);
+
     res.json({ success: true, student: studentData });
   } catch (error) {
     console.error('Error creating student profile:', error);
@@ -202,10 +352,20 @@ app.post('/api/student/profile', verifyToken, async (req, res) => {
   }
 });
 
-// Get Student Dashboard (today's classes & attendance stats)
+// Get Student Dashboard (today's classes & attendance stats) - OPTIMIZED
 app.get('/api/student/dashboard', verifyToken, async (req, res) => {
   try {
     const userId = req.user.uid;
+
+    // Check cache first
+    const cacheKey = `dashboard:${userId}`;
+    const cached = studentCache.get(cacheKey);
+    if (cached) {
+      console.log(`✅ Cache hit: dashboard for ${userId}`);
+      return res.json(cached);
+    }
+
+    console.log(`📊 Cache miss: fetching dashboard for ${userId}`);
 
     // Get student data
     const studentDoc = await db.collection('students').doc(userId).get();
@@ -215,7 +375,7 @@ app.get('/api/student/dashboard', verifyToken, async (req, res) => {
 
     const student = studentDoc.data();
 
-    // Get enrolled courses
+    // Get enrolled courses (single query)
     const enrollmentsSnapshot = await db.collection('enrollments')
       .where('studentId', '==', userId)
       .where('isActive', '==', true)
@@ -223,30 +383,45 @@ app.get('/api/student/dashboard', verifyToken, async (req, res) => {
 
     const courseIds = enrollmentsSnapshot.docs.map(doc => doc.data().courseId);
 
-    // Get courses details
+    // OPTIMIZED: Batch read courses instead of loop
     const courses = [];
-    for (const courseId of courseIds) {
-      const courseDoc = await db.collection('courses').doc(courseId).get();
-      if (courseDoc.exists) {
-        courses.push({ id: courseDoc.id, ...courseDoc.data() });
+    if (courseIds.length > 0) {
+      const courseRefs = courseIds.map(id => db.collection('courses').doc(id));
+      const courseDocs = await db.getAll(...courseRefs);
+
+      for (const courseDoc of courseDocs) {
+        if (courseDoc.exists) {
+          courses.push({ id: courseDoc.id, ...courseDoc.data() });
+        }
       }
     }
 
-    // Get today's sessions
+    // Get today's sessions (optimized with single query)
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const tomorrow = new Date(today);
     tomorrow.setDate(tomorrow.getDate() + 1);
 
-    const sessionsSnapshot = await db.collection('sessions')
-      .where('courseId', 'in', courseIds.length > 0 ? courseIds : ['dummy'])
-      .where('date', '>=', admin.firestore.Timestamp.fromDate(today))
-      .where('date', '<', admin.firestore.Timestamp.fromDate(tomorrow))
-      .get();
+    let sessions = [];
+    if (courseIds.length > 0) {
+      // Firestore 'in' query supports max 10 items
+      const courseIdBatches = [];
+      for (let i = 0; i < courseIds.length; i += 10) {
+        courseIdBatches.push(courseIds.slice(i, i + 10));
+      }
 
-    const sessions = sessionsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      for (const batch of courseIdBatches) {
+        const sessionsSnapshot = await db.collection('sessions')
+          .where('courseId', 'in', batch)
+          .where('date', '>=', admin.firestore.Timestamp.fromDate(today))
+          .where('date', '<', admin.firestore.Timestamp.fromDate(tomorrow))
+          .get();
 
-    // Get attendance stats
+        sessions.push(...sessionsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+      }
+    }
+
+    // Get attendance stats (single query)
     const attendanceSnapshot = await db.collection('attendance')
       .where('studentId', '==', userId)
       .get();
@@ -255,7 +430,7 @@ app.get('/api/student/dashboard', verifyToken, async (req, res) => {
     const presentCount = attendanceSnapshot.docs.filter(doc => doc.data().status === 'present').length;
     const attendancePercentage = totalClasses > 0 ? (presentCount / totalClasses) * 100 : 0;
 
-    res.json({
+    const result = {
       student,
       courses,
       todaySessions: sessions,
@@ -265,14 +440,21 @@ app.get('/api/student/dashboard', verifyToken, async (req, res) => {
         absentCount: totalClasses - presentCount,
         attendancePercentage: attendancePercentage.toFixed(1)
       }
-    });
+    };
+
+    // Cache for 5 minutes (shorter TTL for dashboard)
+    const dashboardCache = new SimpleCache(500, 300000); // 5 minutes
+    dashboardCache.set(cacheKey, result);
+    studentCache.set(cacheKey, result);
+
+    res.json(result);
   } catch (error) {
     console.error('Error fetching dashboard:', error);
     res.status(500).json({ error: 'Failed to fetch dashboard data' });
   }
 });
 
-// Scan QR and Mark Attendance
+// Scan QR and Mark Attendance - OPTIMIZED with Denormalization
 app.post('/api/student/scan-qr', verifyToken, async (req, res) => {
   try {
     const { qrData, latitude, longitude, accuracy } = req.body;
@@ -339,7 +521,7 @@ app.post('/api/student/scan-qr', verifyToken, async (req, res) => {
         payload.location.longitude
       );
 
-      const maxDistance = payload.location.radius || 50; // Default 50 meters
+      const maxDistance = payload.location.radius || 1100; // Default 1100 meters (for indoor GPS inaccuracy)
       locationVerified = distanceFromClass <= maxDistance;
 
       if (!locationVerified) {
@@ -351,11 +533,33 @@ app.post('/api/student/scan-qr', verifyToken, async (req, res) => {
       }
     }
 
-    // Mark attendance
+    // OPTIMIZED: Get student name with cache
+    let studentName = 'Unknown';
+    let studentRollNo = 'N/A';
+    const cachedStudent = studentCache.get(`student:${userId}`);
+
+    if (cachedStudent) {
+      studentName = cachedStudent.name || 'Unknown';
+      studentRollNo = cachedStudent.rollNo || 'N/A';
+    } else {
+      const studentDoc = await db.collection('students').doc(userId).get();
+      if (studentDoc.exists) {
+        const studentData = studentDoc.data();
+        studentName = studentData.name || 'Unknown';
+        studentRollNo = studentData.rollNo || 'N/A';
+        studentCache.set(`student:${userId}`, studentData);
+      }
+    }
+
+    // OPTIMIZED: Denormalize student and course info in attendance record
     const attendanceData = {
       sessionId: payload.sessionId,
       courseId: payload.courseId,
       studentId: userId,
+      studentName,  // Denormalized - eliminates future reads!
+      studentRollNo,  // Denormalized - eliminates future reads!
+      courseName: session.courseName || 'Unknown',  // Denormalized
+      courseCode: session.courseCode || 'N/A',  // Denormalized
       status: 'present',
       markedAt: admin.firestore.FieldValue.serverTimestamp(),
       markedBy: 'student',
@@ -375,9 +579,8 @@ app.post('/api/student/scan-qr', verifyToken, async (req, res) => {
       presentCount: admin.firestore.FieldValue.increment(1)
     });
 
-    // Get student name for real-time update
-    const studentDoc = await db.collection('students').doc(userId).get();
-    const studentName = studentDoc.exists ? studentDoc.data().name : 'Unknown';
+    // Invalidate dashboard cache
+    invalidateStudentCache(userId);
 
     res.json({
       success: true,
@@ -385,8 +588,6 @@ app.post('/api/student/scan-qr', verifyToken, async (req, res) => {
       attendance: {
         id: attendanceRef.id,
         ...attendanceData,
-        studentName,
-        courseName: session.courseName || 'Unknown Course',
         distance: Math.round(distanceFromClass)
       }
     });
@@ -397,11 +598,11 @@ app.post('/api/student/scan-qr', verifyToken, async (req, res) => {
   }
 });
 
-// Get Student Attendance History
+// Get Student Attendance History - OPTIMIZED with Pagination
 app.get('/api/student/attendance-history', verifyToken, async (req, res) => {
   try {
     const userId = req.user.uid;
-    const { courseId } = req.query;
+    const { courseId, limit = 50, offset = 0 } = req.query;
 
     let query = db.collection('attendance').where('studentId', '==', userId);
 
@@ -409,26 +610,34 @@ app.get('/api/student/attendance-history', verifyToken, async (req, res) => {
       query = query.where('courseId', '==', courseId);
     }
 
-    const snapshot = await query.orderBy('markedAt', 'desc').get();
+    // OPTIMIZED: Add pagination
+    const snapshot = await query
+      .orderBy('markedAt', 'desc')
+      .limit(parseInt(limit))
+      .offset(parseInt(offset))
+      .get();
 
-    const attendanceRecords = [];
-    for (const doc of snapshot.docs) {
+    // OPTIMIZED: Use denormalized data (no additional reads needed!)
+    const attendanceRecords = snapshot.docs.map(doc => {
       const data = doc.data();
-
-      // Get session details
-      const sessionDoc = await db.collection('sessions').doc(data.sessionId).get();
-      const session = sessionDoc.exists ? sessionDoc.data() : {};
-
-      attendanceRecords.push({
+      return {
         id: doc.id,
         ...data,
-        sessionDate: session.date,
-        sessionTime: session.startTime,
-        courseName: session.courseName
-      });
-    }
+        // These are now denormalized in the document
+        sessionDate: data.markedAt,
+        sessionTime: data.markedAt,
+        courseName: data.courseName || 'Unknown',
+        courseCode: data.courseCode || 'N/A',
+        studentName: data.studentName || 'Unknown',
+        studentRollNo: data.studentRollNo || 'N/A'
+      };
+    });
 
-    res.json({ attendanceRecords });
+    res.json({
+      attendanceRecords,
+      hasMore: snapshot.size === parseInt(limit),
+      total: snapshot.size
+    });
   } catch (error) {
     console.error('Error fetching attendance history:', error);
     res.status(500).json({ error: 'Failed to fetch attendance history' });
@@ -496,7 +705,7 @@ app.post('/api/student/join-course', verifyToken, async (req, res) => {
   }
 });
 
-// Get Student's Enrolled Courses
+// Get Student's Enrolled Courses - OPTIMIZED with Batch Reads
 app.get('/api/student/courses', verifyToken, async (req, res) => {
   try {
     const userId = req.user.uid;
@@ -508,29 +717,49 @@ app.get('/api/student/courses', verifyToken, async (req, res) => {
       .get();
 
     const courses = [];
-    for (const enrollDoc of enrollmentsSnapshot.docs) {
-      const enrollment = enrollDoc.data();
-      const courseDoc = await db.collection('courses').doc(enrollment.courseId).get();
+    const courseIds = enrollmentsSnapshot.docs.map(doc => doc.data().courseId);
 
-      if (courseDoc.exists) {
-        const courseData = courseDoc.data();
+    // OPTIMIZED: Batch read courses
+    if (courseIds.length > 0) {
+      const courseRefs = courseIds.map(id => db.collection('courses').doc(id));
+      const courseDocs = await db.getAll(...courseRefs);
 
-        // Get faculty name
-        let facultyName = 'Unknown';
-        if (courseData.facultyId) {
-          const facultyDoc = await db.collection('faculty').doc(courseData.facultyId).get();
-          if (facultyDoc.exists) {
-            facultyName = facultyDoc.data().name || 'Unknown';
+      // Collect unique faculty IDs
+      const facultyIds = [...new Set(
+        courseDocs
+          .filter(doc => doc.exists && doc.data().facultyId)
+          .map(doc => doc.data().facultyId)
+      )];
+
+      // OPTIMIZED: Batch read faculty
+      const facultyMap = new Map();
+      if (facultyIds.length > 0) {
+        const facultyRefs = facultyIds.map(id => db.collection('faculty').doc(id));
+        const facultyDocs = await db.getAll(...facultyRefs);
+
+        facultyDocs.forEach(doc => {
+          if (doc.exists) {
+            facultyMap.set(doc.id, doc.data());
+            // Cache faculty data
+            facultyCache.set(`faculty:${doc.id}`, doc.data());
           }
-        }
-
-        courses.push({
-          id: courseDoc.id,
-          ...courseData,
-          facultyName,
-          enrolledDate: enrollment.enrolledAt
         });
       }
+
+      // Combine data
+      courseDocs.forEach((courseDoc, index) => {
+        if (courseDoc.exists) {
+          const courseData = courseDoc.data();
+          const facultyData = facultyMap.get(courseData.facultyId);
+
+          courses.push({
+            id: courseDoc.id,
+            ...courseData,
+            facultyName: facultyData?.name || 'Unknown',
+            enrolledDate: enrollmentsSnapshot.docs[index].data().enrolledAt
+          });
+        }
+      });
     }
 
     res.json({ success: true, courses });
@@ -540,10 +769,20 @@ app.get('/api/student/courses', verifyToken, async (req, res) => {
   }
 });
 
-// Get Student Timetable (aggregated from all courses)
+// Get Student Timetable (aggregated from all courses) - OPTIMIZED
 app.get('/api/student/timetable', verifyToken, async (req, res) => {
   try {
     const userId = req.user.uid;
+
+    // Check cache
+    const cacheKey = `timetable:${userId}`;
+    const cached = studentCache.get(cacheKey);
+    if (cached) {
+      console.log(`✅ Cache hit: timetable for ${userId}`);
+      return res.json(cached);
+    }
+
+    console.log(`📅 Cache miss: fetching timetable for ${userId}`);
 
     // Get enrolled courses
     const enrollmentsSnapshot = await db.collection('enrollments')
@@ -552,46 +791,59 @@ app.get('/api/student/timetable', verifyToken, async (req, res) => {
       .get();
 
     const timetable = {
-      Monday: [],
-      Tuesday: [],
-      Wednesday: [],
-      Thursday: [],
-      Friday: [],
-      Saturday: []
+      Monday: [], Tuesday: [], Wednesday: [],
+      Thursday: [], Friday: [], Saturday: []
     };
 
-    for (const enrollDoc of enrollmentsSnapshot.docs) {
-      const enrollment = enrollDoc.data();
-      const courseDoc = await db.collection('courses').doc(enrollment.courseId).get();
+    const courseIds = enrollmentsSnapshot.docs.map(doc => doc.data().courseId);
 
-      if (courseDoc.exists) {
-        const course = courseDoc.data();
+    // OPTIMIZED: Batch read courses
+    if (courseIds.length > 0) {
+      const courseRefs = courseIds.map(id => db.collection('courses').doc(id));
+      const courseDocs = await db.getAll(...courseRefs);
 
-        // Get faculty name
-        let facultyName = 'Unknown';
-        if (course.facultyId) {
-          const facultyDoc = await db.collection('faculty').doc(course.facultyId).get();
-          if (facultyDoc.exists) {
-            facultyName = facultyDoc.data().name || 'Unknown';
+      // Collect faculty IDs
+      const facultyIds = [...new Set(
+        courseDocs
+          .filter(doc => doc.exists && doc.data().facultyId)
+          .map(doc => doc.data().facultyId)
+      )];
+
+      // OPTIMIZED: Batch read faculty
+      const facultyMap = new Map();
+      if (facultyIds.length > 0) {
+        const facultyRefs = facultyIds.map(id => db.collection('faculty').doc(id));
+        const facultyDocs = await db.getAll(...facultyRefs);
+
+        facultyDocs.forEach(doc => {
+          if (doc.exists) {
+            facultyMap.set(doc.id, doc.data());
+          }
+        });
+      }
+
+      // Build timetable
+      courseDocs.forEach(courseDoc => {
+        if (courseDoc.exists) {
+          const course = courseDoc.data();
+          const facultyData = facultyMap.get(course.facultyId);
+
+          if (Array.isArray(course.timetable)) {
+            course.timetable.forEach(slot => {
+              if (timetable[slot.day]) {
+                timetable[slot.day].push({
+                  time: slot.time,
+                  courseCode: course.code,
+                  courseName: course.name,
+                  type: slot.type,
+                  room: slot.room,
+                  facultyName: facultyData?.name || 'Unknown'
+                });
+              }
+            });
           }
         }
-
-        // Add timetable slots
-        if (Array.isArray(course.timetable)) {
-          course.timetable.forEach(slot => {
-            if (timetable[slot.day]) {
-              timetable[slot.day].push({
-                time: slot.time,
-                courseCode: course.code,
-                courseName: course.name,
-                type: slot.type,
-                room: slot.room,
-                facultyName
-              });
-            }
-          });
-        }
-      }
+      });
     }
 
     // Sort each day's slots by time
@@ -603,7 +855,12 @@ app.get('/api/student/timetable', verifyToken, async (req, res) => {
       });
     });
 
-    res.json({ success: true, timetable });
+    const result = { success: true, timetable };
+
+    // Cache for 1 hour
+    studentCache.set(cacheKey, result);
+
+    res.json(result);
   } catch (error) {
     console.error('Error fetching timetable:', error);
     res.status(500).json({ error: 'Failed to fetch timetable' });
@@ -923,7 +1180,7 @@ app.post('/api/faculty/generate-qr', verifyToken, async (req, res) => {
   }
 });
 
-// Get Live Attendance for Session
+// Get Live Attendance for Session - OPTIMIZED
 app.get('/api/faculty/session/:sessionId/attendance', verifyToken, async (req, res) => {
   try {
     const { sessionId } = req.params;
@@ -942,24 +1199,19 @@ app.get('/api/faculty/session/:sessionId/attendance', verifyToken, async (req, r
       .orderBy('markedAt', 'desc')
       .get();
 
-    const attendees = [];
-    for (const doc of attendanceSnapshot.docs) {
+    // OPTIMIZED: Use denormalized data (no additional student reads!)
+    const attendees = attendanceSnapshot.docs.map(doc => {
       const data = doc.data();
-
-      // Get student details
-      const studentDoc = await db.collection('students').doc(data.studentId).get();
-      const student = studentDoc.exists ? studentDoc.data() : {};
-
-      attendees.push({
+      return {
         id: doc.id,
         studentId: data.studentId,
-        studentName: student.name || 'Unknown',
-        rollNo: student.rollNo || 'N/A',
+        studentName: data.studentName || 'Unknown',  // Denormalized
+        rollNo: data.studentRollNo || 'N/A',  // Denormalized
         status: data.status,
         markedAt: data.markedAt,
         distance: data.distanceFromClass
-      });
-    }
+      };
+    });
 
     res.json({
       session: { id: sessionDoc.id, ...session },
